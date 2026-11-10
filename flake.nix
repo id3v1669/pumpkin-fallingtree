@@ -22,25 +22,29 @@
         "x86_64-darwin"
         "aarch64-darwin"
       ];
-      pkgsFor =
-        system:
-        import nixpkgs {
-          inherit system;
-          overlays = [ rust-overlay.overlays.default ];
-        };
+      # Per-system package set, toolchain and the Rust platform built from it.
+      perSystem =
+        f:
+        forAllSystems (
+          system:
+          let
+            pkgs = import nixpkgs {
+              inherit system;
+              overlays = [ rust-overlay.overlays.default ];
+            };
+            toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+            rustPlatform = pkgs.makeRustPlatform {
+              cargo = toolchain;
+              rustc = toolchain;
+            };
+          in
+          f { inherit pkgs toolchain rustPlatform; }
+        );
+      manifest = (nixpkgs.lib.importTOML ./Cargo.toml).package;
     in
     {
-      packages = forAllSystems (
-        system:
-        let
-          pkgs = pkgsFor system;
-          toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          rustPlatform = pkgs.makeRustPlatform {
-            cargo = toolchain;
-            rustc = toolchain;
-          };
-          manifest = (pkgs.lib.importTOML ./Cargo.toml).package;
-        in
+      packages = perSystem (
+        { pkgs, rustPlatform, ... }:
         {
           # The plugin component: result/lib/fallingtree.wasm
           default = rustPlatform.buildRustPackage {
@@ -67,37 +71,37 @@
         }
       );
 
-      checks = forAllSystems (
-        system:
+      checks = perSystem (
+        { pkgs, rustPlatform, ... }:
         let
-          pkgs = pkgsFor system;
-          toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          rustPlatform = pkgs.makeRustPlatform {
-            cargo = toolchain;
-            rustc = toolchain;
-          };
+          host = pkgs.stdenv.hostPlatform.rust.rustcTarget;
+          check =
+            name: script:
+            rustPlatform.buildRustPackage {
+              pname = "pumpkin-fallingtree-${name}";
+              version = "0";
+              src = pkgs.lib.cleanSource ./.;
+              cargoLock.lockFile = ./Cargo.lock;
+              buildPhase = "true";
+              checkPhase = script;
+              installPhase = "touch $out";
+            };
         in
         {
-          tests = rustPlatform.buildRustPackage {
-            pname = "pumpkin-fallingtree-tests";
-            version = "0";
-            src = pkgs.lib.cleanSource ./.;
-            cargoLock.lockFile = ./Cargo.lock;
-            buildPhase = "true";
-            checkPhase = ''
-              cargo test --offline --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget}
-            '';
-            installPhase = "touch $out";
-          };
+          # The tree logic is tested natively (the plugin glue is wasm-only).
+          tests = check "tests" ''
+            cargo test --offline --target ${host}
+          '';
+          lint = check "lint" ''
+            cargo fmt --check
+            cargo clippy --offline --release -- -D warnings
+            cargo clippy --offline --target ${host} --tests -- -D warnings
+          '';
         }
       );
 
-      devShells = forAllSystems (
-        system:
-        let
-          pkgs = pkgsFor system;
-          toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-        in
+      devShells = perSystem (
+        { pkgs, toolchain, ... }:
         {
           default = pkgs.mkShell {
             packages = [
@@ -109,6 +113,6 @@
         }
       );
 
-      formatter = forAllSystems (system: (pkgsFor system).nixfmt);
+      formatter = perSystem ({ pkgs, ... }: pkgs.nixfmt);
     };
 }

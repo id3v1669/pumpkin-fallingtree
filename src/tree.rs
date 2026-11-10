@@ -21,14 +21,19 @@ pub const FUNGUS_CANOPY_RADIUS: i32 = 4;
 pub const LEAF_REACH: u8 = 6;
 /// Vanilla `distance` value of leaves that are cut off from every log.
 pub const DECAYED_DISTANCE: u8 = 7;
+/// Extra blocks are never broken within this many blocks (x and z) of the world spawn,
+/// for players below permission level 4. Plugin-driven breaks carry no player, so the
+/// server's own spawn protection does not apply to them; this mirrors it. The plugin
+/// API does not expose the server's configured radius, so this is Pumpkin's default.
+pub const SPAWN_PROTECTION_RADIUS: i32 = 16;
 
 pub type Pos = (i32, i32, i32);
 
 /// What the tree logic needs to know about one block.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// A natural log of the given species (`oak`, `spruce`, `crimson`, ...).
-    Log(String),
+    Log(&'static str),
     /// Leaves. `persistent` is true for player-placed leaves.
     Leaves {
         persistent: bool,
@@ -51,7 +56,7 @@ pub trait BlockView {
 pub fn classify(name: &str, properties: &[(String, String)]) -> Kind {
     let name = name.strip_prefix("minecraft:").unwrap_or(name);
     if let Some(species) = log_species(name) {
-        return Kind::Log(species.to_owned());
+        return Kind::Log(species);
     }
     if name.ends_with("_leaves") {
         let prop = |key: &str| {
@@ -60,11 +65,11 @@ pub fn classify(name: &str, properties: &[(String, String)]) -> Kind {
                 .find(|(k, _)| k == key)
                 .map(|(_, v)| v.as_str())
         };
+        // Unknown properties fall on the safe side: a leaf counts as natural only when
+        // it says so, and as cut off only when its distance says so.
         return Kind::Leaves {
-            persistent: prop("persistent") == Some("true"),
-            distance: prop("distance")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DECAYED_DISTANCE),
+            persistent: prop("persistent") != Some("false"),
+            distance: prop("distance").and_then(|v| v.parse().ok()).unwrap_or(0),
         };
     }
     match name {
@@ -92,7 +97,7 @@ const FUNGUS_SPECIES: &[&str] = &["crimson", "warped"];
 ///
 /// Only explicitly listed species qualify, so crop stems (`pumpkin_stem`,
 /// `attached_melon_stem`), `mushroom_stem` and `big_dripleaf_stem` are never logs.
-pub fn log_species(name: &str) -> Option<&str> {
+pub fn log_species(name: &str) -> Option<&'static str> {
     let name = name.strip_prefix("minecraft:").unwrap_or(name);
     let find = |suffixes: [&str; 2], species: &[&'static str]| {
         suffixes
@@ -107,9 +112,17 @@ fn is_fungus(species: &str) -> bool {
     FUNGUS_SPECIES.contains(&species)
 }
 
-/// True for any axe item id (`minecraft:iron_axe`, ...), but not pickaxes.
+/// True for any axe item id (`minecraft:iron_axe`, ...). Pickaxes end in `_pickaxe`,
+/// which does not end in `_axe`.
 pub fn is_axe(item_id: &str) -> bool {
-    item_id.ends_with("_axe") && !item_id.ends_with("_pickaxe")
+    item_id.ends_with("_axe")
+}
+
+/// Is `pos` inside the spawn-protected square around `spawn`?
+/// See [`SPAWN_PROTECTION_RADIUS`].
+pub fn in_spawn_protection(pos: Pos, spawn: Pos) -> bool {
+    (pos.0 - spawn.0).abs() <= SPAWN_PROTECTION_RADIUS
+        && (pos.2 - spawn.2).abs() <= SPAWN_PROTECTION_RADIUS
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -143,6 +156,11 @@ fn is_fungus_canopy_of(kind: &Kind, species: &str) -> bool {
         Kind::FungusCanopy { wart_of: None } => true,
         _ => false,
     }
+}
+
+/// Is `kind` a log of `species`?
+pub fn is_log_of(kind: Kind, species: &str) -> bool {
+    matches!(kind, Kind::Log(s) if s == species)
 }
 
 fn neighbours26(p: Pos) -> impl Iterator<Item = Pos> {
@@ -186,7 +204,7 @@ pub fn find_tree(view: &mut impl BlockView, origin: Pos, species: &str) -> Optio
             if n.1 < origin.1 || !seen_logs.insert(n) {
                 continue;
             }
-            if view.kind(n) == Kind::Log(species.to_owned()) {
+            if is_log_of(view.kind(n), species) {
                 if logs.len() == MAX_LOGS {
                     return None;
                 }
@@ -297,17 +315,16 @@ pub fn leaf_is_orphaned(view: &mut impl BlockView, pos: Pos) -> bool {
 
 /// Vanilla Unbreaking for tools: a use costs durability with chance 1 / (level + 1).
 pub fn consumes_durability(unbreaking_level: u32, rng: &mut Rng) -> bool {
-    unbreaking_level == 0 || rng.below(unbreaking_level + 1) == 0
+    unbreaking_level == 0 || rng.below(unbreaking_level.saturating_add(1)) == 0
 }
 
 /// Durability plan for felling, decided before any block is broken.
 ///
-/// The plan is reserved on the axe up front, so moving the axe mid-felling can't dodge
-/// the cost, and then settled against the logs that actually broke.
+/// The whole plan is charged to the axe up front, so moving the axe mid-felling can't
+/// dodge the cost; afterwards the logs that did not break are refunded.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Charge {
     damage: i32,
-    max_damage: i32,
     /// Per planned log: does it cost a point? Ends at the log that breaks the axe.
     costs: Vec<bool>,
 }
@@ -333,11 +350,7 @@ impl Charge {
             total += i32::from(cost);
             costs.push(cost);
         }
-        Self {
-            damage,
-            max_damage,
-            costs,
-        }
+        Self { damage, costs }
     }
 
     /// How many of the planned logs the axe can pay for.
@@ -345,25 +358,15 @@ impl Charge {
         self.costs.len()
     }
 
-    /// Damage if every planned log breaks; reserved on the axe before felling.
+    /// Damage if every planned log breaks; written to the axe before felling.
     pub fn reserved_damage(&self) -> i32 {
         self.damage + self.cost_of(|_| true)
     }
 
-    /// The plan uses the axe up. It is then taken away before felling (so it can't be
-    /// moved out of reach), and given back only if failed breaks earn a refund.
-    pub fn breaks_axe(&self) -> bool {
-        self.reserved_damage() >= self.max_damage
-    }
-
-    pub fn max_damage(&self) -> i32 {
-        self.max_damage
-    }
-
-    /// Final damage once felling is done, counting only the logs for which `broke(i)`
-    /// is true. The axe breaks if this reaches `max_damage`.
-    pub fn settled_damage(&self, broke: impl Fn(usize) -> bool) -> i32 {
-        self.damage + self.cost_of(broke)
+    /// Points to give back once felling is done: the cost of the planned logs for which
+    /// `broke(i)` is false.
+    pub fn refund(&self, broke: impl Fn(usize) -> bool) -> i32 {
+        self.cost_of(|i| !broke(i))
     }
 
     fn cost_of(&self, include: impl Fn(usize) -> bool) -> i32 {
@@ -410,7 +413,12 @@ mod tests {
 
     impl World {
         fn log(&mut self, p: Pos, species: &str) {
-            self.0.insert(p, Kind::Log(species.into()));
+            let species = TREE_SPECIES
+                .iter()
+                .chain(FUNGUS_SPECIES)
+                .find(|&&known| known == species)
+                .expect("known species");
+            self.0.insert(p, Kind::Log(species));
         }
         fn leaves(&mut self, p: Pos, persistent: bool) {
             self.0.insert(
@@ -425,7 +433,7 @@ mod tests {
 
     impl BlockView for World {
         fn kind(&mut self, pos: Pos) -> Kind {
-            self.0.get(&pos).cloned().unwrap_or(Kind::Other)
+            self.0.get(&pos).copied().unwrap_or(Kind::Other)
         }
     }
 
@@ -449,11 +457,11 @@ mod tests {
 
     #[test]
     fn classify_logs_and_leaves() {
-        assert_eq!(classify("minecraft:oak_log", &[]), Kind::Log("oak".into()));
-        assert_eq!(classify("dark_oak_wood", &[]), Kind::Log("dark_oak".into()));
+        assert_eq!(classify("minecraft:oak_log", &[]), Kind::Log("oak"));
+        assert_eq!(classify("dark_oak_wood", &[]), Kind::Log("dark_oak"));
         assert_eq!(
             classify("minecraft:crimson_stem", &[]),
-            Kind::Log("crimson".into())
+            Kind::Log("crimson")
         );
         assert_eq!(classify("minecraft:stripped_oak_log", &[]), Kind::Other);
         assert_eq!(classify("minecraft:mushroom_stem", &[]), Kind::Other);
@@ -468,6 +476,18 @@ mod tests {
                 distance: 7
             }
         );
+        // Missing properties: neither natural canopy nor orphaned.
+        let unknown = classify("minecraft:birch_leaves", &[]);
+        assert_eq!(
+            unknown,
+            Kind::Leaves {
+                persistent: true,
+                distance: 0
+            }
+        );
+        let mut w = World::default();
+        w.0.insert((0, 0, 0), unknown);
+        assert!(!leaf_is_orphaned(&mut w, (0, 0, 0)));
         assert_eq!(classify("minecraft:shroomlight", &[]), SHROOMLIGHT);
         assert_eq!(classify("minecraft:nether_wart_block", &[]), CRIMSON_WART);
     }
@@ -477,6 +497,16 @@ mod tests {
         assert!(is_axe("minecraft:netherite_axe"));
         assert!(!is_axe("minecraft:diamond_pickaxe"));
         assert!(!is_axe("minecraft:stick"));
+    }
+
+    #[test]
+    fn spawn_protection_square() {
+        let spawn = (100, 64, -100);
+        let r = SPAWN_PROTECTION_RADIUS;
+        assert!(in_spawn_protection((100, 0, -100), spawn));
+        assert!(in_spawn_protection((100 + r, 200, -100 - r), spawn));
+        assert!(!in_spawn_protection((100 + r + 1, 64, -100), spawn));
+        assert!(!in_spawn_protection((100, 64, -100 - r - 1), spawn));
     }
 
     #[test]
@@ -683,18 +713,15 @@ mod tests {
         let charge = Charge::plan(10, 55, 59, 0, &mut rng);
         assert_eq!(charge.logs(), 4);
         assert_eq!(charge.reserved_damage(), 59);
-        assert!(charge.breaks_axe());
-        assert_eq!(charge.settled_damage(|_| true), 59);
 
-        // The reviewer's case: 1 point left, one more log breaks the axe.
+        // 1 point left: one more log breaks the axe.
         let charge = Charge::plan(5, 58, 59, 0, &mut rng);
         assert_eq!(charge.logs(), 1);
-        assert!(charge.breaks_axe());
+        assert_eq!(charge.reserved_damage(), 59);
 
         let charge = Charge::plan(3, 0, 59, 0, &mut rng);
         assert_eq!(charge.logs(), 3);
         assert_eq!(charge.reserved_damage(), 3);
-        assert!(!charge.breaks_axe());
 
         assert_eq!(Charge::plan(0, 10, 59, 0, &mut rng).reserved_damage(), 10);
         // Already at the limit: nothing can be paid for.
@@ -705,10 +732,32 @@ mod tests {
     fn charge_refunds_failed_breaks() {
         let mut rng = Rng::new(1);
         let charge = Charge::plan(10, 55, 59, 0, &mut rng);
-        // A protection plugin rejected every extra break: no durability is used.
-        assert_eq!(charge.settled_damage(|_| false), 55);
+        // A protection plugin rejected every extra break: everything comes back.
+        assert_eq!(charge.refund(|_| false), 4);
         // Only the first two broke.
-        assert_eq!(charge.settled_damage(|i| i < 2), 57);
+        assert_eq!(charge.refund(|i| i < 2), 2);
+        assert_eq!(charge.refund(|_| true), 0);
+    }
+
+    #[test]
+    fn charge_with_unbreaking() {
+        let mut rng = Rng::new(7);
+        // Unbreaking III: every log is planned, about a quarter of them cost a point.
+        let charge = Charge::plan(100, 10, 1000, 3, &mut rng);
+        assert_eq!(charge.logs(), 100);
+        let cost = charge.reserved_damage() - 10;
+        assert!((10..45).contains(&cost), "{cost}");
+        // Refund and actual cost always add up to the reservation.
+        assert_eq!(
+            charge.refund(|i| i % 2 == 0) + charge.refund(|i| i % 2 != 0),
+            cost
+        );
+        // Free logs stretch a nearly broken axe past its remaining points.
+        let charge = Charge::plan(100, 57, 59, 3, &mut rng);
+        assert!(charge.logs() >= 2);
+        assert_eq!(charge.reserved_damage(), 59);
+        // An absurd level must not overflow.
+        assert!((0..50).any(|_| !consumes_durability(u32::MAX, &mut rng)));
     }
 
     #[test]

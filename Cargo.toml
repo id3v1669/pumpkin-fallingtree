@@ -2,6 +2,8 @@
 name = "pumpkin-fallingtree"
 version = "0.1.0"
 edition = "2024"
+authors = ["id3v1669"]
+repository = "https://github.com/id3v1669/pumpkin-fallingtree"
 license = "GPL-3.0-only"
 description = "FallingTree-style tree felling for the Pumpkin Minecraft server"
 publish = false
