@@ -8,13 +8,25 @@ Minecraft server, written in Rust as a WebAssembly plugin against plugin **ABI v
 - **Sneak** and break a natural log with an **axe** to fell the whole tree.
   Without sneaking, a log breaks normally.
 - Connected logs of the same species at or above the cut are broken, diagonals
-  included, up to 256 logs. Supported: `acacia`, `birch`, `cherry`, `dark_oak`, `jungle`,
-  `mangrove`, `oak`, `pale_oak`, `poplar`, `spruce` (`_log` / `_wood`) and the huge fungi
-  `crimson`, `warped` (`_stem` / `_hyphae`). Stripped logs and crop or mushroom stems are ignored.
-- A tree is only felled if the right natural canopy touches it: non-persistent leaves
-  for trees, wart blocks / shroomlight for huge fungi. Log cabins are left alone.
-- The axe loses 1 durability per extra log (vanilla Unbreaking odds), charged before
-  anything is broken. If that breaks the axe, only the logs it paid for are felled.
+  included. Supported: `acacia`, `birch`, `cherry`, `dark_oak`, `jungle`, `mangrove`,
+  `oak`, `pale_oak`, `poplar`, `spruce` (`_log` / `_wood`) and the huge fungi `crimson`,
+  `warped` (`_stem` / `_hyphae`). Stripped logs, planks and crop or mushroom stems are
+  never part of a tree.
+- Build protection, modelled on FallingTree's defaults:
+  - A group of more than 120 connected logs is not felled at all.
+  - Natural canopy must touch a top-most log: non-persistent leaves for trees, the
+    species' own wart block for huge fungi (shroomlight alone doesn't count). A wall or
+    beam that only brushes a tree's leaves lower down is left alone.
+- Huge fungi: their wart blocks and shroomlight (which never decay) are broken with the
+  stems: those connected to the stems, within 4 blocks horizontally of the cut and at
+  most 1 block above the top stem. This only happens once every stem is down; if any
+  stem is left (break rejected, or the axe could not pay for it), the canopy stays.
+- The axe loses 1 durability per extra log that actually breaks (vanilla Unbreaking odds).
+  The cost is reserved before felling, so moving the axe mid-felling can't dodge it: if
+  the tree uses the axe up, the axe is taken away before felling starts. Logs that don't
+  break (for example, rejected by a protection plugin) are refunded, and a taken axe is
+  given back if it was not used up after all. If the axe can't pay for the whole tree,
+  only the logs it can pay for are felled.
   Creative mode costs no durability and drops nothing.
 - Every block is rechecked right before it is broken, and felling only happens in the
   world where the log was cut.

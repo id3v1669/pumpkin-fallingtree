@@ -26,6 +26,7 @@ use exports::pumpkin::plugin::{gametest_callbacks, metadata};
 use pumpkin::plugin::common::{BlockPos, GameMode, Hand};
 use pumpkin::plugin::enchantments::Enchantment;
 use pumpkin::plugin::event::{EventPriority, EventType};
+use pumpkin::plugin::item_stack::ItemStack;
 use pumpkin::plugin::logging::{Level, log};
 use pumpkin::plugin::player::Player;
 use pumpkin::plugin::scheduler::schedule_delayed_task;
@@ -33,7 +34,7 @@ use pumpkin::plugin::sounds::{Sound, SoundCategory};
 use pumpkin::plugin::uuid::Uuid;
 use pumpkin::plugin::world::{BlockFlags, World, block_state_to_info};
 
-use crate::tree::{self, BlockView, Kind, Pos, Rng};
+use crate::tree::{self, BlockView, Charge, Kind, Pos, Rng};
 
 const BREAK_HANDLER: u32 = 1;
 const FELL_TASK: u32 = 1;
@@ -46,6 +47,14 @@ struct FellJob {
     world_id: String,
     origin: Pos,
     species: String,
+}
+
+/// Where the reserved axe is while felling runs.
+enum Reserved {
+    /// Still in its slot with the reserved damage; this copy identifies it.
+    InSlot(ItemStack),
+    /// Taken out of the inventory because the plan uses it up.
+    Taken(ItemStack),
 }
 
 struct LeafJob {
@@ -159,6 +168,7 @@ async fn fell(server: &ServerInstance, job: FellJob) {
 
     let mode = player.get_gamemode();
     let drop_items = mode != GameMode::Creative;
+    let mut reservation = None;
     if uses_durability(mode) && axe.is_damageable().await && !axe.is_unbreakable().await {
         let unbreaking = axe
             .get_enchantments()
@@ -173,7 +183,7 @@ async fn fell(server: &ServerInstance, job: FellJob) {
                 ^ (oy as u64).rotate_left(20)
                 ^ oz as u64,
         );
-        let charge = tree::charge_axe(
+        let charge = Charge::plan(
             found.logs.len(),
             axe.get_damage().await,
             axe.get_max_damage().await,
@@ -181,40 +191,93 @@ async fn fell(server: &ServerInstance, job: FellJob) {
             &mut rng,
         );
 
-        // Charge before breaking anything, so moving the axe mid-felling can't dodge
-        // the cost. Only write if the slot still holds the exact axe we read; otherwise
-        // fell nothing rather than overwrite another item.
+        // Reserve the cost before breaking anything, so moving the axe mid-felling can't
+        // dodge it. Only touch the slot if it still holds the exact axe we read;
+        // otherwise fell nothing rather than overwrite another item.
         let Some(current) = player.get_inventory_item(slot) else {
             return;
         };
         if !current.is_similar(axe).await {
             return;
         }
-        if charge.broke {
+        current.set_damage(charge.reserved_damage()).await;
+        if charge.breaks_axe() {
+            // The plan uses the axe up: take it now, so it can't be moved out of reach of
+            // settlement. `current` is kept in case failed breaks earn it back.
             player.set_inventory_item(slot, None).await;
-            world.play_sound(
-                Sound::EntityItemBreak,
-                SoundCategory::Players,
-                player.get_position(),
-                0.8,
-                1.0,
-            );
+            reservation = Some((charge, Reserved::Taken(current)));
         } else {
-            current.set_damage(charge.damage).await;
+            let written = current.clone().await;
             player.set_inventory_item(slot, Some(current)).await;
+            reservation = Some((charge, Reserved::InSlot(written)));
         }
-        found.logs.truncate(charge.logs);
     }
 
+    let planned = found.logs.len();
+    if let Some((charge, _)) = &reservation {
+        found.logs.truncate(charge.logs());
+    }
+    let mut broken = Vec::with_capacity(found.logs.len());
     for &pos in &found.logs {
         // Breaks are awaited one by one; a block may have been replaced meanwhile.
-        if view.kind(pos) == Kind::Log(job.species.clone()) {
-            world
+        let ok = view.kind(pos) == Kind::Log(job.species.clone())
+            && world
                 .break_block(block_pos(pos), drop_items, break_flags())
                 .await;
+        broken.push(ok);
+    }
+    // Fungal canopy never decays, so it goes with the stems (free, like leaves), but only
+    // once every stem is down: canopy still held up by remaining stems stays.
+    let fully_felled = broken.len() == planned && broken.iter().all(|&ok| ok);
+    if fully_felled {
+        for &pos in &found.fungus_canopy {
+            if tree::is_fungus_canopy_at(&mut view, pos, &job.species) {
+                world
+                    .break_block(block_pos(pos), drop_items, break_flags())
+                    .await;
+            }
         }
     }
     drop(view);
+
+    // Settle the reservation against the logs that actually broke: refund those that
+    // didn't (replaced, or rejected by a protection plugin), and break the axe only if
+    // the real breaks used it up.
+    if let Some((charge, reserved)) = reservation {
+        let settled = charge.settled_damage(|i| broken[i]);
+        match reserved {
+            Reserved::Taken(axe) if settled >= charge.max_damage() => {
+                drop(axe);
+                world.play_sound(
+                    Sound::EntityItemBreak,
+                    SoundCategory::Players,
+                    player.get_position(),
+                    0.8,
+                    1.0,
+                );
+            }
+            Reserved::Taken(axe) => {
+                // Refunded: give the axe back, to its slot if still free.
+                axe.set_damage(settled).await;
+                if player.get_inventory_item(slot).is_none() {
+                    player.set_inventory_item(slot, Some(axe)).await;
+                } else {
+                    player.get_inventory().give_item(axe, true).await;
+                }
+            }
+            // If the player moved the axe meanwhile they only forfeit a refund: the full
+            // cost is already on it.
+            Reserved::InSlot(written) => {
+                if settled != charge.reserved_damage()
+                    && let Some(current) = player.get_inventory_item(slot)
+                    && current.is_similar(written).await
+                {
+                    current.set_damage(settled).await;
+                    player.set_inventory_item(slot, Some(current)).await;
+                }
+            }
+        }
+    }
 
     if !found.leaves.is_empty() {
         let job = LeafJob {
