@@ -1,0 +1,19 @@
+[package]
+name = "pumpkin-fallingtree"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "FallingTree-style tree felling for the Pumpkin Minecraft server"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wit-bindgen = { version = "0.63", default-features = false, features = ["macros", "async", "realloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
